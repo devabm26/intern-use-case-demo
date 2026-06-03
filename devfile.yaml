@@ -1,6 +1,6 @@
 schemaVersion: 2.3.0
 metadata:
-  name: cli-ai-tools
+  name: ai-vibe-tool
 components:
   - name: tools
     container:
@@ -9,3 +9,9 @@ components:
       memoryLimit: 16Gi
       cpuLimit: '4'
       cpuRequest: '0.5'
+      endpoints:
+        - name: streamlit-ui
+          targetPort: 8501
+          exposure: public
+          protocol: http
+          secure: true
