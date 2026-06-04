@@ -15,6 +15,11 @@ components:
           exposure: public
           protocol: http
           secure: true
+        - name: flask-ui
+          targetPort: 5000
+          exposure: public
+          protocol: http
+          secure: true  
 commands:
   - id: install-opencode
     exec:
