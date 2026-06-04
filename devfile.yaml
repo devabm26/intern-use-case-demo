@@ -4,11 +4,14 @@ metadata:
 components:
   - name: tools
     container:
-      image: quay.io/devfile/universal-developer-image:ubi9-3764be6
+      image: quay.io/devfile/universal-developer-image:ubi9-latest
       memoryRequest: 1Gi
       memoryLimit: 16Gi
       cpuLimit: '4'
       cpuRequest: '0.5'
+      env:
+        - name: XDG_CONFIG_HOME
+          value: /home/user/.podman-config
       endpoints:
         - name: streamlit-ui
           targetPort: 8501
