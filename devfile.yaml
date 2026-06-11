@@ -4,7 +4,7 @@ metadata:
 components:
   - name: tools
     container:
-      image: registry.redhat.io/devspaces/udi-rhel9:latest
+      image: quay.io/devfile/universal-developer-image:ubi9-latest
       memoryRequest: 1Gi
       memoryLimit: 16Gi
       cpuLimit: '4'
@@ -32,6 +32,6 @@ commands:
       group:
         kind: build
         isDefault: true
-# events:
-#   postStart:
-#     - install-opencode        
+events:
+  postStart:
+    - install-opencode        
