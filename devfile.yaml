@@ -32,6 +32,6 @@ commands:
       group:
         kind: build
         isDefault: true
-events:
-  postStart:
-    - install-opencode        
+# events:
+#   postStart:
+#     - install-opencode        
