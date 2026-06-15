@@ -10,8 +10,14 @@ components:
       cpuLimit: '4'
       cpuRequest: '0.5'
       env:
+        - name: DOCKER
+          value: podman
         - name: XDG_CONFIG_HOME
-          value: /home/user/.podman-config
+          value: /tmp/.config
+        - name: XDG_DATA_HOME
+          value: /tmp/.local/share
+        - name: XDG_RUNTIME_DIR
+          value: /tmp/run
       endpoints:
         - name: streamlit-ui
           targetPort: 8501
@@ -24,6 +30,11 @@ components:
           protocol: http
           secure: true  
 commands:
+  - id: init-podman-runtime-dir
+    exec:
+      component: tools
+      commandLine: "mkdir -p /tmp/run"
+      workingDir: ${PROJECTS_ROOT}
   - id: install-opencode
     exec:
       component: tools
@@ -34,4 +45,5 @@ commands:
         isDefault: true
 events:
   postStart:
+    - init-podman-runtime-dir
     - install-opencode        
