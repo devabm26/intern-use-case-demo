@@ -19,7 +19,7 @@ components:
           protocol: http
           secure: true
         - name: flask-ui
-          targetPort: 5000
+          targetPort: 8080
           exposure: public
           protocol: http
           secure: true  
