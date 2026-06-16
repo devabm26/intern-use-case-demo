@@ -1,0 +1,20 @@
+I need to build a simple web dashboard for our thoughts database reporting. Looking at @db_metadata.txt, I need to create a Flask web app that:
+
+1. Shows all thoughts from the database in a nice table format
+2. Displays: content, author, status, thumbs_up, thumbs_down, net rating, similarity_score
+3. Connects to PostgreSQL at:
+   - Host: postgresql.thoughts-app.svc.cluster.local
+   - Database: thoughts
+   - Username: thoughts  
+   - Password: thoughts123
+
+
+I need to demo this in 2 hours. Keep it simple and working! 
+
+-------
+
+I want to run this generate a script to execute this locally. DB Already exists in cluster, up and running.
+
+-------
+
+Generate a ContainerFile.
