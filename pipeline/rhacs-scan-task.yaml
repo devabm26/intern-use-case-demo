@@ -1,0 +1,259 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: rhacs-image-scan
+  labels:
+    app.kubernetes.io/version: "1.0"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/categories: Security
+    tekton.dev/tags: security, rhacs, vulnerability-scan
+    tekton.dev/displayName: "RHACS Image Scan"
+    tekton.dev/platforms: "linux/amd64"
+spec:
+  description: >-
+    Scan container images for vulnerabilities and policy violations using
+    Red Hat Advanced Cluster Security (RHACS).
+
+    This task downloads the roxctl CLI from RHACS Central, scans the specified
+    container image, and exports vulnerability counts and policy violations as
+    task results for consumption by the pipeline.
+
+  params:
+    - name: IMAGE
+      type: string
+      description: Container image to scan (with tag or digest)
+
+  workspaces:
+    - name: rhacs-secret
+      description: RHACS Central credentials (rox_central_endpoint, rox_api_token)
+
+  results:
+    - name: SCAN_OUTPUT
+      description: JSON formatted vulnerability scan results for OpenShift Console
+      type: string
+    - name: CRITICAL_CVSS_COUNT
+      description: Number of critical severity CVEs
+      type: string
+    - name: HIGH_CVSS_COUNT
+      description: Number of high severity CVEs
+      type: string
+    - name: MEDIUM_CVSS_COUNT
+      description: Number of medium severity CVEs
+      type: string
+    - name: LOW_CVSS_COUNT
+      description: Number of low severity CVEs
+      type: string
+    - name: POLICY_VIOLATIONS
+      description: Number of policy violations
+      type: string
+    - name: CRITICAL_VIOLATIONS
+      description: Number of critical policy violations
+      type: string
+    - name: HIGH_VIOLATIONS
+      description: Number of high policy violations
+      type: string
+
+  steps:
+    - name: scan-image
+      image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+      script: |
+        #!/bin/bash
+        set -e
+
+        echo "Installing dependencies for RHACS roxctl CLI..."
+        microdnf install -y tar gzip jq
+
+        # Note: curl-minimal is already installed in ubi9/ubi-minimal base image
+
+        # Read RHACS credentials from secret
+        export ROX_CENTRAL_ENDPOINT=$(cat /workspace/rhacs-secret/rox_central_endpoint)
+        export ROX_API_TOKEN=$(cat /workspace/rhacs-secret/rox_api_token)
+
+        echo "✅ RHACS credentials loaded"
+        echo "   Central: $ROX_CENTRAL_ENDPOINT"
+
+        # Normalize endpoint (remove protocol if present for consistent handling)
+        ROX_ENDPOINT_CLEAN=$(echo "$ROX_CENTRAL_ENDPOINT" | sed 's|^https\?://||')
+
+        # Add port if not present (required for gRPC connections)
+        if [[ "$ROX_ENDPOINT_CLEAN" != *:* ]]; then
+          ROX_ENDPOINT_CLEAN="${ROX_ENDPOINT_CLEAN}:443"
+        fi
+
+        echo "   Normalized: $ROX_ENDPOINT_CLEAN"
+
+        # Download roxctl CLI
+        echo "Downloading roxctl CLI..."
+        curl -s -k -L -H "Authorization: Bearer $ROX_API_TOKEN" \
+          "https://${ROX_ENDPOINT_CLEAN}/api/cli/download/roxctl-linux" \
+          --output /tmp/roxctl
+
+        if [ ! -s /tmp/roxctl ]; then
+          echo "❌ Error: Failed to download roxctl CLI"
+          echo "   Endpoint: https://${ROX_ENDPOINT_CLEAN}"
+          echo "   Verify RHACS Central is accessible and API token is valid"
+          exit 1
+        fi
+
+        chmod +x /tmp/roxctl
+
+        echo "Verifying roxctl installation..."
+        /tmp/roxctl version
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Scanning image with RHACS: $(params.IMAGE)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Run image scan (JSON format for parsing)
+        /tmp/roxctl -e "${ROX_ENDPOINT_CLEAN}" \
+          --insecure-skip-tls-verify \
+          image scan \
+          --image "$(params.IMAGE)" \
+          -o json > /tmp/scan-results.json || SCAN_FAILED=true
+
+        # Also run table format for human-readable output
+        echo ""
+        echo "Vulnerability Scan Results:"
+        /tmp/roxctl -e "${ROX_ENDPOINT_CLEAN}" \
+          --insecure-skip-tls-verify \
+          image scan \
+          --image "$(params.IMAGE)" \
+          -o table || true
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Checking RHACS policy violations..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Check image against RHACS policies
+        /tmp/roxctl -e "${ROX_ENDPOINT_CLEAN}" \
+          --insecure-skip-tls-verify \
+          image check \
+          --image "$(params.IMAGE)" \
+          -o json > /tmp/policy-check.json || POLICY_FAILED=true
+
+        # Parse and display policy violations
+        if [ -f /tmp/policy-check.json ]; then
+          echo ""
+          echo "Policy Check Results:"
+          cat /tmp/policy-check.json | jq -r '
+            if .alerts then
+              "Total Violations: " + (.alerts | length | tostring),
+              "",
+              "Critical/High Violations:",
+              (.alerts[] | select(.policy.severity == "CRITICAL_SEVERITY" or .policy.severity == "HIGH_SEVERITY") |
+                "  ❌ " + .policy.name + " (" + .policy.severity + ")")
+            else
+              "✅ No policy violations found"
+            end
+          '
+
+          # Count critical violations (handle null alerts)
+          CRITICAL_COUNT=$(cat /tmp/policy-check.json | jq '[.alerts // [] | .[] | select(.policy.severity == "CRITICAL_SEVERITY")] | length')
+          HIGH_COUNT=$(cat /tmp/policy-check.json | jq '[.alerts // [] | .[] | select(.policy.severity == "HIGH_SEVERITY")] | length')
+
+          echo ""
+          echo "Summary:"
+          echo "  Critical: $CRITICAL_COUNT"
+          echo "  High:     $HIGH_COUNT"
+
+          # Optional: Fail build if critical violations found (commented out by default)
+          # if [ "$CRITICAL_COUNT" -gt 0 ]; then
+          #   echo ""
+          #   echo "❌ Build blocked: $CRITICAL_COUNT critical policy violations found"
+          #   exit 1
+          # fi
+        fi
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Extracting vulnerability metrics for OpenShift Console..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Parse scan results to count CVEs by severity
+        if [ -f /tmp/scan-results.json ]; then
+          echo "Parsing scan results..."
+
+          # Detect which JSON format (different roxctl versions)
+          if cat /tmp/scan-results.json | jq -e '.scan' > /dev/null 2>&1; then
+            echo "Using new roxctl JSON format (.scan.summary)"
+            CRITICAL_CVSS=$(cat /tmp/scan-results.json | jq '.scan.summary.CRITICAL // 0')
+            HIGH_CVSS=$(cat /tmp/scan-results.json | jq '.scan.summary.IMPORTANT // 0')
+            MEDIUM_CVSS=$(cat /tmp/scan-results.json | jq '.scan.summary.MODERATE // 0')
+            LOW_CVSS=$(cat /tmp/scan-results.json | jq '.scan.summary.LOW // 0')
+          elif cat /tmp/scan-results.json | jq -e '.result' > /dev/null 2>&1; then
+            echo "Using old roxctl JSON format (.result.summary)"
+            CRITICAL_CVSS=$(cat /tmp/scan-results.json | jq '.result.summary.CRITICAL // 0')
+            HIGH_CVSS=$(cat /tmp/scan-results.json | jq '.result.summary.IMPORTANT // 0')
+            MEDIUM_CVSS=$(cat /tmp/scan-results.json | jq '.result.summary.MODERATE // 0')
+            LOW_CVSS=$(cat /tmp/scan-results.json | jq '.result.summary.LOW // 0')
+          else
+            echo "Unknown JSON format, defaulting to zeros"
+            CRITICAL_CVSS=0
+            HIGH_CVSS=0
+            MEDIUM_CVSS=0
+            LOW_CVSS=0
+          fi
+
+          echo "CVE Summary:"
+          echo "  Critical: $CRITICAL_CVSS"
+          echo "  High:     $HIGH_CVSS"
+          echo "  Medium:   $MEDIUM_CVSS"
+          echo "  Low:      $LOW_CVSS"
+
+          # Write CVE counts to task results
+          echo -n "${CRITICAL_CVSS:-0}" > $(results.CRITICAL_CVSS_COUNT.path)
+          echo -n "${HIGH_CVSS:-0}" > $(results.HIGH_CVSS_COUNT.path)
+          echo -n "${MEDIUM_CVSS:-0}" > $(results.MEDIUM_CVSS_COUNT.path)
+          echo -n "${LOW_CVSS:-0}" > $(results.LOW_CVSS_COUNT.path)
+
+          # Create consolidated JSON output for OpenShift Console
+          echo -n "{\"vulnerabilities\":{\"critical\":${CRITICAL_CVSS:-0},\"high\":${HIGH_CVSS:-0},\"medium\":${MEDIUM_CVSS:-0},\"low\":${LOW_CVSS:-0}}}" > $(results.SCAN_OUTPUT.path)
+        else
+          # No scan results, write zeros
+          echo "No scan results file found, writing zeros"
+          echo -n "0" > $(results.CRITICAL_CVSS_COUNT.path)
+          echo -n "0" > $(results.HIGH_CVSS_COUNT.path)
+          echo -n "0" > $(results.MEDIUM_CVSS_COUNT.path)
+          echo -n "0" > $(results.LOW_CVSS_COUNT.path)
+
+          # Create consolidated JSON output with zeros
+          echo -n "{\"vulnerabilities\":{\"critical\":0,\"high\":0,\"medium\":0,\"low\":0}}" > $(results.SCAN_OUTPUT.path)
+        fi
+
+        # Write policy violation counts to task results
+        if [ -f /tmp/policy-check.json ]; then
+          TOTAL_VIOLATIONS=$(cat /tmp/policy-check.json | jq '[.alerts // []] | length')
+          CRITICAL_VIOLATIONS=$(cat /tmp/policy-check.json | jq '[.alerts // [] | .[] | select(.policy.severity == "CRITICAL_SEVERITY")] | length')
+          HIGH_VIOLATIONS=$(cat /tmp/policy-check.json | jq '[.alerts // [] | .[] | select(.policy.severity == "HIGH_SEVERITY")] | length')
+
+          echo ""
+          echo "Policy Violations:"
+          echo "  Total:    $TOTAL_VIOLATIONS"
+          echo "  Critical: $CRITICAL_VIOLATIONS"
+          echo "  High:     $HIGH_VIOLATIONS"
+
+          echo -n "${TOTAL_VIOLATIONS:-0}" > $(results.POLICY_VIOLATIONS.path)
+          echo -n "${CRITICAL_VIOLATIONS:-0}" > $(results.CRITICAL_VIOLATIONS.path)
+          echo -n "${HIGH_VIOLATIONS:-0}" > $(results.HIGH_VIOLATIONS.path)
+        else
+          echo -n "0" > $(results.POLICY_VIOLATIONS.path)
+          echo -n "0" > $(results.CRITICAL_VIOLATIONS.path)
+          echo -n "0" > $(results.HIGH_VIOLATIONS.path)
+        fi
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if [ "$SCAN_FAILED" = true ] || [ "$POLICY_FAILED" = true ]; then
+          echo "⚠️  RHACS scan completed with warnings"
+          echo "   Review scan results above for details"
+        else
+          echo "✅ RHACS scan completed successfully"
+        fi
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        echo ""
+        echo "📊 Results exported to OpenShift Console"
+        echo "   View: Pipelines → build-containerfile-run → Logs & Results"

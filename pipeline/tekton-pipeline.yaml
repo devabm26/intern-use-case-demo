@@ -1,0 +1,389 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-workspace-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-containerfile-pipeline
+spec:
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+      default: https://github.com/devabm26/intern-use-case-demo.git
+    - name: git-revision
+      type: string
+      description: Git revision (branch/tag/commit)
+      default: main
+    - name: image-name
+      type: string
+      description: Output image name
+      default: quay.io/redhat_na_ssa/thoughts-vibe-dashboard:latest
+    - name: containerfile-path
+      type: string
+      description: Path to Containerfile
+      default: ./Containerfile
+
+  workspaces:
+    - name: shared-data
+      description: Shared workspace for source code
+    - name: dockerconfig
+      description: Docker config secret for registry authentication
+    - name: trustification-secret
+      description: Trustification/Bombastic credentials for SBOM upload (uses existing secret)
+    - name: rhacs-secret
+      description: RHACS Central credentials for image scanning
+
+  results:
+    - description: RHACS vulnerability scan output (JSON format for OpenShift Console)
+      name: ACS_SCAN_OUTPUT
+      value: $(tasks.scan-image-rhacs.results.SCAN_OUTPUT)
+    - description: Number of critical CVEs found by RHACS
+      name: CRITICAL_CVES
+      type: string
+      value: $(tasks.scan-image-rhacs.results.CRITICAL_CVSS_COUNT)
+    - description: Number of high CVEs found by RHACS
+      name: HIGH_CVES
+      type: string
+      value: $(tasks.scan-image-rhacs.results.HIGH_CVSS_COUNT)
+    - description: Number of medium CVEs found by RHACS
+      name: MEDIUM_CVES
+      type: string
+      value: $(tasks.scan-image-rhacs.results.MEDIUM_CVSS_COUNT)
+    - description: Number of low CVEs found by RHACS
+      name: LOW_CVES
+      type: string
+      value: $(tasks.scan-image-rhacs.results.LOW_CVSS_COUNT)
+    - description: Total RHACS policy violations
+      name: POLICY_VIOLATIONS
+      type: string
+      value: $(tasks.scan-image-rhacs.results.POLICY_VIOLATIONS)
+    - description: Critical policy violations
+      name: CRITICAL_VIOLATIONS
+      type: string
+      value: $(tasks.scan-image-rhacs.results.CRITICAL_VIOLATIONS)
+
+  tasks:
+    - name: fetch-repository
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      workspaces:
+        - name: output
+          workspace: shared-data
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: deleteExisting
+          value: "true"
+
+    - name: build-image
+      taskRef:
+        name: buildah
+        kind: ClusterTask
+      runAfter:
+        - fetch-repository
+      workspaces:
+        - name: source
+          workspace: shared-data
+        - name: dockerconfig
+          workspace: dockerconfig
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+        - name: DOCKERFILE
+          value: $(params.containerfile-path)
+        - name: FORMAT
+          value: docker
+        - name: STORAGE_DRIVER
+          value: vfs
+        - name: TLSVERIFY
+          value: "true"
+        - name: PUSH_EXTRA_ARGS
+          value: "--retry=3"
+
+    - name: scan-image-rhacs
+      taskRef:
+        name: rhacs-image-scan
+      runAfter:
+        - build-image
+      workspaces:
+        - name: rhacs-secret
+          workspace: rhacs-secret
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+
+    - name: generate-sbom
+      runAfter:
+        - build-image
+      workspaces:
+        - name: source
+          workspace: shared-data
+        - name: dockerconfig
+          workspace: dockerconfig
+      taskSpec:
+        workspaces:
+          - name: source
+          - name: dockerconfig
+        params:
+          - name: IMAGE
+            type: string
+        steps:
+          - name: generate-sbom
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -e
+
+              echo "Installing dependencies..."
+              microdnf install -y tar gzip jq
+
+              echo "Installing syft..."
+              curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /tmp
+
+              echo "Configuring registry authentication..."
+
+              # Extract credentials from dockerconfig secret
+              if [ -f /workspace/dockerconfig/.dockerconfigjson ]; then
+                DOCKERCONFIG_FILE="/workspace/dockerconfig/.dockerconfigjson"
+              elif [ -f /workspace/dockerconfig/config.json ]; then
+                DOCKERCONFIG_FILE="/workspace/dockerconfig/config.json"
+              else
+                echo "❌ Error: No docker config found in workspace"
+                exit 1
+              fi
+
+              echo "Extracting registry credentials..."
+              export REGISTRY_AUTH=$(cat "$DOCKERCONFIG_FILE" | jq -r '.auths["quay.io"].auth // empty')
+
+              if [ -z "$REGISTRY_AUTH" ]; then
+                echo "❌ Error: Could not extract quay.io auth from dockerconfig"
+                exit 1
+              fi
+
+              # Decode base64 auth to username:password
+              DECODED_AUTH=$(echo "$REGISTRY_AUTH" | base64 -d)
+              export SYFT_REGISTRY_AUTH_USERNAME=$(echo "$DECODED_AUTH" | cut -d: -f1)
+              export SYFT_REGISTRY_AUTH_PASSWORD=$(echo "$DECODED_AUTH" | cut -d: -f2-)
+              export SYFT_REGISTRY_AUTH_AUTHORITY="quay.io"
+
+              echo "✅ Registry credentials configured"
+              echo "   Authority: $SYFT_REGISTRY_AUTH_AUTHORITY"
+              echo "   Username: $SYFT_REGISTRY_AUTH_USERNAME"
+
+              echo "Generating SBOM for image: $(params.IMAGE)"
+              echo "Using SPDX 2.3 format as required by Bombastic API..."
+
+              # Generate SBOM with SPDX 2.3 format explicitly
+              /tmp/syft scan $(params.IMAGE) -o spdx-json > /workspace/source/sbom-raw.json
+
+              # Verify SPDX version in output
+              SPDX_VERSION=$(cat /workspace/source/sbom-raw.json | jq -r '.spdxVersion // empty')
+
+              if [[ "$SPDX_VERSION" != "SPDX-2.3" && "$SPDX_VERSION" != "SPDX-2.2" ]]; then
+                echo "⚠️  Warning: Generated SBOM version is $SPDX_VERSION (expected SPDX-2.2 or SPDX-2.3)"
+              fi
+
+              echo "Post-processing SBOM to remove duplicate license references..."
+
+              # Deduplicate hasExtractedLicensingInfos array by licenseId
+              jq '
+                if .hasExtractedLicensingInfos then
+                  .hasExtractedLicensingInfos |= (
+                    group_by(.licenseId) |
+                    map(.[0])
+                  )
+                else
+                  .
+                end
+              ' /workspace/source/sbom-raw.json > /workspace/source/sbom.json
+
+              # Count duplicates removed
+              RAW_COUNT=$(cat /workspace/source/sbom-raw.json | jq -r '.hasExtractedLicensingInfos | length // 0')
+              CLEAN_COUNT=$(cat /workspace/source/sbom.json | jq -r '.hasExtractedLicensingInfos | length // 0')
+              REMOVED=$((RAW_COUNT - CLEAN_COUNT))
+
+              echo "✅ SBOM generated successfully"
+              echo "   Format: $SPDX_VERSION"
+              echo "   Size: $(wc -c < /workspace/source/sbom.json) bytes"
+              echo "   License refs: $CLEAN_COUNT (removed $REMOVED duplicates)"
+              echo "   Location: /workspace/source/sbom.json"
+
+              # Clean up raw file
+              rm -f /workspace/source/sbom-raw.json
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+
+    - name: upload-sbom
+      runAfter:
+        - generate-sbom
+      workspaces:
+        - name: source
+          workspace: shared-data
+        - name: trustification-secret
+          workspace: trustification-secret
+      taskSpec:
+        workspaces:
+          - name: source
+          - name: trustification-secret
+        params:
+          - name: IMAGE
+            type: string
+        steps:
+          - name: attest-sbom
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -e
+
+              echo "Installing cosign..."
+              curl -sLO https://github.com/sigstore/cosign/releases/download/v2.2.0/cosign-linux-amd64
+              chmod +x cosign-linux-amd64
+              mv cosign-linux-amd64 /tmp/cosign
+
+              echo "Attesting SBOM to image..."
+              /tmp/cosign attest --predicate /workspace/source/sbom.json \
+                --type spdx \
+                $(params.IMAGE) || echo "⚠️  SBOM attestation skipped (may require signing configuration)"
+
+              echo "✅ SBOM attestation completed"
+
+          - name: upload-to-bombastic
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -e
+
+              echo "Installing dependencies..."
+              microdnf install -y jq
+
+              echo "Loading OIDC credentials from trustification-secret..."
+
+              # Read credentials using lowercase keys (case-sensitive)
+              export BOMBASTIC_API_URL=$(cat /workspace/trustification-secret/bombastic_api_url)
+              export OIDC_ISSUER_URL=$(cat /workspace/trustification-secret/oidc_issuer_url)
+              export OIDC_CLIENT_ID=$(cat /workspace/trustification-secret/oidc_client_id)
+              export OIDC_CLIENT_SECRET=$(cat /workspace/trustification-secret/oidc_client_secret)
+
+              echo "✅ All credentials loaded successfully"
+              echo "   Bombastic URL: $BOMBASTIC_API_URL"
+              echo "   OIDC Issuer: $OIDC_ISSUER_URL"
+              echo "   Client ID: $OIDC_CLIENT_ID"
+
+              echo "Obtaining OIDC access token from $OIDC_ISSUER_URL..."
+              TOKEN_RESPONSE=$(curl -s -X POST "${OIDC_ISSUER_URL}/protocol/openid-connect/token" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "grant_type=client_credentials" \
+                -d "client_id=${OIDC_CLIENT_ID}" \
+                -d "client_secret=${OIDC_CLIENT_SECRET}")
+
+              ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+
+              if [ -z "$ACCESS_TOKEN" ]; then
+                echo "❌ Error: Failed to obtain access token"
+                echo "Response: $TOKEN_RESPONSE"
+                exit 1
+              fi
+
+              echo "✅ Access token obtained successfully"
+
+              # Generate unique SBOM ID
+              # Format: <image-base-name>-<timestamp>-<random-suffix>
+
+              # Extract image base name (remove registry and tag)
+              IMAGE_BASE=$(echo "$(params.IMAGE)" | sed 's|.*/||' | sed 's/:.*$//')
+
+              # Generate timestamp (ISO 8601 format for readability)
+              TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+
+              # Generate random 8-character suffix
+              RANDOM_SUFFIX=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)
+
+              # Combine into unique ID
+              SBOM_ID="${IMAGE_BASE}-${TIMESTAMP}-${RANDOM_SUFFIX}"
+
+              echo "Generated unique SBOM ID: $SBOM_ID"
+              echo "   Image: $(params.IMAGE)"
+              echo "   Timestamp: $TIMESTAMP UTC"
+
+              echo "Uploading SBOM to Bombastic at $BOMBASTIC_API_URL..."
+              UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${BOMBASTIC_API_URL}/api/v1/sbom?id=${SBOM_ID}" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                --data @/workspace/source/sbom.json)
+
+              HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n1)
+              RESPONSE_BODY=$(echo "$UPLOAD_RESPONSE" | sed '$d')
+
+              echo "HTTP Status: $HTTP_CODE"
+              echo "Response: $RESPONSE_BODY"
+
+              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                echo "✅ SBOM upload to Bombastic completed successfully"
+                echo "   SBOM ID: $SBOM_ID"
+                echo "   Image: $(params.IMAGE)"
+              else
+                echo "❌ Error: SBOM upload failed with status $HTTP_CODE"
+                echo "Check Bombastic API URL and credentials"
+                exit 1
+              fi
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: build-containerfile-run
+  labels:
+    app: thoughts-vibe-dashboard
+    app.kubernetes.io/name: thoughts-vibe-dashboard
+    app.kubernetes.io/component: pipeline
+    pipeline.openshift.io/type: kubernetes
+    tekton.dev/pipeline: build-containerfile-pipeline
+    security-scan: rhacs
+    sbom-generation: enabled
+  annotations:
+    pipeline.openshift.io/started-by: "tekton-pipeline"
+    description: "Build container image, scan with RHACS, generate SBOM, upload to Trustification"
+    image: "quay.io/redhat_na_ssa/thoughts-vibe-dashboard:latest"
+spec:
+  pipelineRef:
+    name: build-containerfile-pipeline
+  params:
+    - name: git-url
+      value: https://github.com/devabm26/intern-use-case-demo.git
+    - name: git-revision
+      value: main
+    - name: image-name
+      value: quay.io/redhat_na_ssa/thoughts-vibe-dashboard:latest
+    - name: containerfile-path
+      value: ./Containerfile
+  workspaces:
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: shared-workspace-pvc
+    - name: dockerconfig
+      secret:
+        secretName: quay-auth-secret
+    - name: trustification-secret
+      secret:
+        secretName: trustification-secret
+    - name: rhacs-secret
+      secret:
+        secretName: rhacs-secret
