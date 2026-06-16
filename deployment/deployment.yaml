@@ -52,7 +52,7 @@ spec:
         image: quay.io/redhat_na_ssa/thoughts-vibe-dashboard:latest
         imagePullPolicy: Always
         ports:
-        - containerPort: 5000
+        - containerPort: 8080
           name: http
           protocol: TCP
         env:
@@ -106,14 +106,14 @@ spec:
         livenessProbe:
           httpGet:
             path: /
-            port: 5000
+            port: 8080
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
         readinessProbe:
           httpGet:
             path: /
-            port: 5000
+            port: 8080
           initialDelaySeconds: 10
           periodSeconds: 5
           timeoutSeconds: 3
@@ -135,7 +135,7 @@ spec:
   ports:
   - name: http
     port: 80
-    targetPort: 5000
+    targetPort: 8080
     protocol: TCP
 
 ---
