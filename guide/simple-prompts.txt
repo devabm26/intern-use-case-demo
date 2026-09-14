@@ -17,4 +17,4 @@ I want to run this generate a script to execute this locally. DB Already exists 
 
 -------
 
-Generate a ContainerFile.
+Create a ContainerFile using 3.11 version of python - need to make sure it has everything
